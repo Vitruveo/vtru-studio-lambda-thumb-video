@@ -1,3 +1,4 @@
+/* eslint-disable no-console */
 const { spawn } = require('child_process');
 const { parse: parseFileName, join } = require('path');
 const s3client = require('@aws-sdk/client-s3');
@@ -5,7 +6,7 @@ const fs = require('fs/promises');
 
 const ffmpeg = async (inputFile, outputFile) =>
     new Promise((resolve, reject) => {
-        const process = spawn('ffmpeg', [
+        const process = spawn('/opt/ffmpeg/ffmpeg', [
             '-i',
             inputFile,
             '-vf',
@@ -16,6 +17,15 @@ const ffmpeg = async (inputFile, outputFile) =>
             '1',
             outputFile,
         ]);
+
+        process.stderr.on('data', (data) => {
+            console.log(data.toString());
+        });
+
+        process.stdout.on('data', (data) => {
+            console.error(data.toString());
+        });
+
         process.on('close', (code) => {
             if (code === 0) {
                 resolve();
@@ -33,16 +43,19 @@ const downloadFromS3 = async ({ file, bucket, region }) => {
             Key: file,
         })
     );
+    const endFileName = join('/', 'tmp', file);
+    const parsedFileName = parseFileName(endFileName);
+    await fs.mkdir(parsedFileName.dir, { recursive: true });
     await fs.writeFile(join('/', 'tmp', file), data.Body);
 };
 
-const uploadToS3 = async ({ file, bucket, region }) => {
+const uploadToS3 = async ({ file, key, bucket, region }) => {
     const s3 = new s3client.S3Client({ region });
     const body = await fs.readFile(join('/', 'tmp', file));
     await s3.send(
         new s3client.PutObjectCommand({
             Bucket: bucket,
-            Key: file,
+            Key: key,
             Body: body,
         })
     );
@@ -57,8 +70,10 @@ const generateThumb = async ({ filename, bucket, region }) => {
         region,
     });
     await ffmpeg(join('/', 'tmp', filename), join('/', 'tmp', thumbFilename));
+    const endFileName = join(parsedFileName.dir, thumbFilename);
     await uploadToS3({
         file: thumbFilename,
+        key: endFileName,
         bucket,
         region,
     });

@@ -23,6 +23,8 @@ custom:
 functions:
     postprocess:
         handler: handler.postprocess
+        layers:
+            - { Ref: FfmpegLambdaLayer }
         events:
             - s3:
                   bucket: ${self:custom.bucket}
