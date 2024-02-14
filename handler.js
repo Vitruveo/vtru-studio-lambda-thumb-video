@@ -63,7 +63,7 @@ const uploadToS3 = async ({ file, key, bucket, region }) => {
 
 const generateThumb = async ({ filename, bucket, region }) => {
     const parsedFileName = parseFileName(filename);
-    const thumbFilename = `${parsedFileName.name}.jpg`;
+    const thumbFilename = `${parsedFileName.name}_thumb.jpg`;
     await downloadFromS3({
         file: filename,
         bucket,
@@ -93,7 +93,7 @@ module.exports.postprocess = async (event) => {
 
 const deleteThumb = async ({ filename, bucket, region }) => {
     const parsedFileName = parseFileName(filename);
-    const thumbFilename = `${parsedFileName.name}.jpg`;
+    const thumbFilename = `${parsedFileName.name}_thumb.jpg`;
     const s3 = new s3client.S3Client({ region });
     await s3.send(
         new s3client.DeleteObjectCommand({
