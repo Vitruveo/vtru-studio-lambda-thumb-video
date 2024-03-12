@@ -23,6 +23,8 @@ custom:
 functions:
     postprocess:
         handler: handler.postprocess
+        environment:
+            NOTIFY_API_URL: ${param:NOTIFY_API_URL}
         layers:
             - { Ref: FfmpegLambdaLayer }
         events:
