@@ -71,7 +71,13 @@ const ffmpegTransformVideo = async (
         let change = false;
 
         if (width && height) {
-            command.push('-vf', `scale=${width}:${height}`);
+            if (width > height) {
+                command.push('-vf', `scale=${width}:-2`);
+            } else if (width < height) {
+                command.push('-vf', `scale=-2:${height}`);
+            } else {
+                command.push('-vf', `scale=${width}:${height}`);
+            }
             change = true;
         }
 
@@ -209,8 +215,6 @@ const generateClipAndReplaceOriginal = async ({
         height,
         bitrate
     );
-
-    console.log('passei aqui:', res);
 
     if (!res) {
         await notify({ filename, size: stats.size });
