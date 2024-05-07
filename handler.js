@@ -55,6 +55,37 @@ const getVideoDurationInSeconds = (filePath) =>
         });
     });
 
+const ffmpegThumbnail = async (inputFile, outputFile) =>
+    new Promise((resolve, reject) => {
+        const process = spawn('/opt/ffmpeg/ffmpeg', [
+            '-i',
+            inputFile,
+            '-vf',
+            'thumbnail',
+            '-qscale:v',
+            '3',
+            '-frames:v',
+            '1',
+            outputFile,
+        ]);
+        process.stderr.on('data', (data) => {
+            console.log('STDERR: ', data.toString());
+        });
+        process.stdout.on('data', (data) => {
+            console.error('STDOUT: ', data.toString());
+        });
+        process.on('error', (error) => {
+            console.error('Error on process:', error);
+        });
+        process.on('close', (code) => {
+            if (code === 0) {
+                resolve(true);
+            } else {
+                reject(new Error('ffmpeg failed'));
+            }
+        });
+    });
+
 const ffmpegTransformVideo = async (
     inputFile,
     outputFile,
@@ -201,26 +232,30 @@ const generateClipAndReplaceOriginal = async ({
         bitrate
     );
 
-    if (!res) {
-        await notify({ filename, size: stats.size });
-        return;
+    if (res) {
+        await fs.unlink(filePath);
+        await fs.rename(tempPath, filePath);
+        stats = await fs.stat(filePath);
+        await uploadToS3({
+            file: filePath,
+            key: filename,
+            bucket,
+            region,
+            metadata: {
+                fromtransform: 'true',
+            },
+        });
     }
 
-    await fs.unlink(filePath);
-    await fs.rename(tempPath, filePath);
-    stats = await fs.stat(filePath);
-
+    const thumbPath = join('/', 'tmp', `${parsedFileName.name}_thumb.jpg`);
+    await ffmpegThumbnail(filePath, thumbPath);
     await uploadToS3({
-        file: filePath,
-        key: filename,
+        file: thumbPath,
+        key: `${parsedFileName.dir}/${parsedFileName.name}_thumb.jpg`,
         bucket,
-        region,
-        metadata: {
-            fromtransform: 'true',
-        },
     });
-
     await fs.unlink(filePath);
+    await fs.unlink(thumbPath);
     await notify({ filename, size: stats.size });
 };
 
