@@ -1,37 +1,32 @@
 /* eslint-disable no-return-assign */
 /* eslint-disable no-await-in-loop */
 /* eslint-disable no-console */
-const axios = require('axios');
+const fs = require('fs/promises');
 const { spawn } = require('child_process');
 const { parse: parseFileName, join } = require('path');
+const axios = require('axios');
 const s3client = require('@aws-sdk/client-s3');
-const fs = require('fs/promises');
+
+const NOTIFY_API_URL = `${process.env.NOTIFY_API_URL}/assets/notify/file`;
 
 const notify = async ({ filename, size }) => {
-    const url = `${process.env.NOTIFY_API_URL}/assets/notify/file`;
     const data = { filename, size };
-
-    console.log('url:', url);
-
     try {
-        const response = await axios.put(url, data);
-        console.log(`Status: ${response.status}`);
-        console.log('Body: ', response.data);
+        const response = await axios.put(NOTIFY_API_URL, data);
+        console.log(`NOTIFY - Status: ${response.status}`);
+        console.log('NOTIFY - Body: ', response.data);
     } catch (error) {
-        console.error(`Error: ${error}`);
+        console.error(`NOTIFY - Error: ${error}`);
     }
 };
 
+// convert 86 to 01:26:00
 const secondsToHms = (d) => {
     const convert = Number(d);
     const h = Math.floor(convert / 3600);
     const m = Math.floor((convert % 3600) / 60);
     const s = Math.floor((convert % 3600) % 60);
-
-    const hDisplay = h > 0 ? h + (h === 1 ? ':' : ':') : '';
-    const mDisplay = m > 0 ? m + (m === 1 ? ':' : ':') : '';
-    const sDisplay = s > 0 ? s : '';
-    return hDisplay + mDisplay + sDisplay;
+    return [h.toString(), m.toString(), s.toString()].join(':');
 };
 
 const getVideoDurationInSeconds = (filePath) =>
@@ -47,8 +42,10 @@ const getVideoDurationInSeconds = (filePath) =>
         ]);
 
         let output = '';
-
-        command.stdout.on('data', (chunk) => (output += chunk));
+        command.stdout.on('data', (chunk) => (output += chunk.toString()));
+        command.on('error', (error) => {
+            reject(new Error(`ffprobe failed: ${error}`));
+        });
         command.on('close', (code) => {
             if (code !== 0) {
                 reject(new Error(`ffprobe exited with code ${code}`));
@@ -67,8 +64,8 @@ const ffmpegTransformVideo = async (
     bitrate
 ) =>
     new Promise((resolve, reject) => {
-        const command = ['-y', '-i', inputFile];
         let change = false;
+        const command = ['-y', '-i', inputFile];
 
         if (width && height) {
             if (width > height) {
@@ -88,15 +85,15 @@ const ffmpegTransformVideo = async (
 
         command.push(outputFile);
 
-        if (rangeTime?.start && rangeTime?.end) {
-            const { start, end } = rangeTime;
-            console.log('start:', start);
-            console.log('end:', end);
-            const duration = parseInt(end, 10) - parseInt(start, 10);
-            command.unshift(secondsToHms(duration));
-            command.unshift('-t');
-            command.unshift(secondsToHms(start === '0' ? '1' : start));
-            command.unshift('-ss');
+        const { start, end } = rangeTime;
+        if (start && end) {
+            const duration = end - start;
+            command.unshift(
+                '-t',
+                secondsToHms(duration),
+                '-ss',
+                secondsToHms(start === '0' ? '1' : start)
+            );
             change = true;
         }
 
@@ -104,25 +101,16 @@ const ffmpegTransformVideo = async (
             resolve(change);
         } else {
             console.log('command:', command.join(' '));
-
             const process = spawn('/opt/ffmpeg/ffmpeg', command);
-
             process.stderr.on('data', (data) => {
-                console.log(data.toString());
+                console.log('STDERR: ', data.toString());
             });
-
             process.stdout.on('data', (data) => {
-                console.error(data.toString());
+                console.error('STDOUT: ', data.toString());
             });
-
             process.on('error', (error) => {
-                console.error('Error from process:', error);
+                console.error('Error on process:', error);
             });
-
-            process.stderr.on('error', (error) => {
-                console.error('Error from stderr:', error);
-            });
-
             process.on('close', (code) => {
                 if (code === 0) {
                     resolve(change);
@@ -141,26 +129,38 @@ const downloadFromS3 = async ({ file, bucket, region }) => {
             Key: file,
         })
     );
-    const endFileName = join('/', 'tmp', file);
-    const parsedFileName = parseFileName(endFileName);
-    await fs.mkdir(parsedFileName.dir, { recursive: true });
-    await fs.writeFile(join('/', 'tmp', file), data.Body);
-
+    const parsedFileName = parseFileName(file);
+    const endFileName = join('/', 'tmp', parsedFileName.base);
+    await fs.writeFile(endFileName, data.Body);
     return data.Metadata;
 };
 
-const uploadToS3 = async ({ file, key, bucket, region }) => {
+const uploadToS3 = async ({ file, key, bucket, region, metadata }) => {
     const s3 = new s3client.S3Client({ region });
-    const body = await fs.readFile(join('/', 'tmp', file));
+    const body = await fs.readFile(file);
     await s3.send(
         new s3client.PutObjectCommand({
             Bucket: bucket,
             Key: key,
             Body: body,
+            Metadata: metadata,
         })
     );
 };
 
+const deleteFromS3 = async ({ file, bucket, region }) => {
+    const s3 = new s3client.S3Client({ region });
+    await s3.send(
+        new s3client.DeleteObjectCommand({
+            Bucket: bucket,
+            Key: file,
+        })
+    );
+};
+
+//
+// assumption: maxsize for preview videos is < 10MB otherwise it will be enormous
+//
 const generateClipAndReplaceOriginal = async ({
     filename,
     bucket,
@@ -171,45 +171,30 @@ const generateClipAndReplaceOriginal = async ({
     height,
 }) => {
     const parsedFileName = parseFileName(filename);
-
-    console.log('filename:', filename);
-    console.log('rangeTime:', rangeTime);
-
-    const tempFilename = `${parsedFileName.name}_temp.mp4`;
-
-    console.log('tempFilename:', tempFilename);
-
-    console.log('width:', width, 'height:', height);
-
-    const filePath = join('/', 'tmp', filename);
-
-    let stats = await fs.stat(join('/', 'tmp', filename));
-    let bitrate = null;
-    const fileSizeInBytes = stats.size;
-    const fileSizeInMegabytes = fileSizeInBytes / (1024 * 1024);
-
-    console.log(
-        `meu video: ${fileSizeInMegabytes} é maior que ${maxSize}?`,
-        fileSizeInMegabytes > maxSize
+    const filePath = join('/', 'tmp', parsedFileName.base);
+    const tempPath = join(
+        '/',
+        'tmp',
+        `${parsedFileName.name}_temp.${parsedFileName.ext}`
     );
 
+    // if is need to "compress" the video, we will use bitrate
+    let bitrate = null;
+    let stats = await fs.stat(filePath);
+    const fileSizeInMegabytes = stats.size / (1024 * 1024);
     if (fileSizeInMegabytes > maxSize) {
-        const fileSizeInKb = Number.parseInt(maxSize, 10) * 8192;
-        if (rangeTime?.start && rangeTime?.end) {
-            bitrate =
-                fileSizeInKb /
-                (parseInt(rangeTime.end, 10) - parseInt(rangeTime.start, 10));
+        const fileSizeInKb = maxSize * 1024;
+        if (rangeTime.start && rangeTime.end) {
+            bitrate = fileSizeInKb / (rangeTime.end - rangeTime.start);
         } else {
             const durationInSeconds = await getVideoDurationInSeconds(filePath);
             bitrate = fileSizeInKb / durationInSeconds;
         }
     }
 
-    console.log('bitrate:', bitrate);
-
     const res = await ffmpegTransformVideo(
         filePath,
-        join('/', 'tmp', tempFilename),
+        tempPath,
         rangeTime,
         width,
         height,
@@ -221,35 +206,27 @@ const generateClipAndReplaceOriginal = async ({
         return;
     }
 
-    await fs.rename(join('/', 'tmp', tempFilename), join('/', 'tmp', filename));
-
-    stats = await fs.stat(join('/', 'tmp', filename));
-
-    console.log(
-        'filename:',
-        filename,
-        'key:',
-        join(parsedFileName.dir, filename),
-        'size:',
-        stats.size
-    );
+    await fs.unlink(filePath);
+    await fs.rename(tempPath, filePath);
+    stats = await fs.stat(filePath);
 
     await uploadToS3({
-        file: filename,
+        file: filePath,
         key: filename,
         bucket,
         region,
+        metadata: {
+            fromtransform: 'true',
+        },
     });
 
+    await fs.unlink(filePath);
     await notify({ filename, size: stats.size });
 };
 
 const generateThumb = async ({ filename, bucket, region }) => {
-    console.log('filename:', filename);
     const parsedFileName = parseFileName(filename);
-    console.log('parsedFileName:', parsedFileName);
-
-    if (parsedFileName.name.endsWith('_thumb')) {
+    if (parsedFileName.name.includes('_thumb')) {
         console.log('File has already been processed, skipping');
         return;
     }
@@ -260,19 +237,24 @@ const generateThumb = async ({ filename, bucket, region }) => {
         region,
     });
 
-    console.log('metadata:', metadata);
-
-    if (metadata && Object.values(metadata)?.length > 0) {
+    if (metadata && metadata.fromtransform !== 'true') {
         await generateClipAndReplaceOriginal({
             filename,
             bucket,
             region,
-            width: metadata.width,
-            height: metadata.height,
-            maxSize: metadata.maxsize,
+
+            width: parseInt(metadata.width, 10), // Max width (comes from studio)
+            height: parseInt(metadata.height, 10), // Max height (comes from Studio)
+            maxSize: parseInt(metadata.maxsize, 10), // Max allowed size for this media (from Studio)
+
+            // if it's a preview clip or not
             rangeTime: {
-                start: metadata.rangetimestart,
-                end: metadata.rangetimeend,
+                start: metadata.rangetimestart
+                    ? parseFloat(metadata.rangetimestart)
+                    : null,
+                end: metadata.rangetimeend
+                    ? parseFloat(metadata.rangetimeend)
+                    : null,
             },
         });
     }
@@ -292,30 +274,26 @@ module.exports.postprocess = async (event) => {
 
 const deleteThumb = async ({ filename, bucket, region }) => {
     try {
-        console.log(
-            `[DeleteThumb] Starting thumbnail deletion. Filename: ${filename}, Bucket: ${bucket}, Region: ${region}`
-        );
-
         const parsedFileName = parseFileName(filename);
-        const thumbFilename = `${parsedFileName.name}_thumb.jpg`;
-        const endFileName = join(parsedFileName.dir, thumbFilename);
-        const s3 = new s3client.S3Client({ region });
-        await s3.send(
-            new s3client.DeleteObjectCommand({
-                Bucket: bucket,
-                Key: endFileName,
-            })
+        const endFileName = join(
+            parsedFileName.dir,
+            `${parsedFileName.name}_thumb.jpg`
         );
-
-        console.log(
-            `[DeleteThumb] Thumbnail deletion completed. Filename: ${endFileName}, Bucket: ${bucket}, Region: ${region}`
-        );
+        await deleteFromS3({
+            file: endFileName,
+            bucket,
+            region,
+        });
     } catch (error) {
-        console.log(error);
+        console.log('DELETETHUMB - Failed:', {
+            filename,
+            bucket,
+            region,
+            error: error.message,
+        });
     }
 };
 
-// deleta o thumbnail a partir do nome do arquivo original
 module.exports.postdelete = async (event) => {
     await Promise.all(
         event.Records.map((record) =>
